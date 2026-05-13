@@ -104,6 +104,11 @@ class OpenAIClient(BaseLLMClient):
                     )
             else:
                 llm_kwargs["api_key"] = "ollama"
+
+            # Disable thinking/reasoning for DeepSeek to avoid
+            # reasoning_content passthrough issues
+            if self.provider == "deepseek":
+                llm_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         elif self.base_url:
             llm_kwargs["base_url"] = self.base_url
 
