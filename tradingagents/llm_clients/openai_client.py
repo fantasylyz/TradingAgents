@@ -2,8 +2,6 @@ import os
 from typing import Any, Optional
 
 from langchain_openai import ChatOpenAI
-import httpx
-from httpx._client import _DEFAULT_TIMEOUT_CONFIG
 
 from .base_client import BaseLLMClient, normalize_content
 from .validators import validate_model
@@ -17,8 +15,37 @@ class NormalizedChatOpenAI(ChatOpenAI):
     downstream handling.
     """
 
+    @staticmethod
+    def _strip_reasoning_content(msg):
+        """Strip reasoning_content from AIMessage to avoid DeepSeek API errors.
+
+        DeepSeek's thinking mode returns reasoning_content in assistant messages.
+        When these messages are sent back in subsequent requests, LangChain may
+        not serialize them in the exact format DeepSeek expects, causing a 400
+        error: "The reasoning_content in the thinking mode must be passed back
+        to the API." Stripping the field before sending avoids this entirely.
+        """
+        if hasattr(msg, "additional_kwargs"):
+            msg.additional_kwargs.pop("reasoning_content", None)
+        if hasattr(msg, "response_metadata"):
+            msg.response_metadata.pop("reasoning_content", None)
+        return msg
+
     def invoke(self, input, config=None, **kwargs):
-        return normalize_content(super().invoke(input, config, **kwargs))
+        # DeepSeek requires reasoning_content to be preserved verbatim when
+        # assistant messages from thinking-mode responses are included in a
+        # conversation history. LangChain's message serialization does not
+        # guarantee this, so we strip the field from all input messages and
+        # from the response to prevent accumulation in the conversation state.
+        if isinstance(input, list):
+            for msg in input:
+                self._strip_reasoning_content(msg)
+        elif hasattr(input, "additional_kwargs"):
+            self._strip_reasoning_content(input)
+
+        result = super().invoke(input, config, **kwargs)
+        self._strip_reasoning_content(result)
+        return normalize_content(result)
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
         """Wrap with structured output, defaulting to function_calling for OpenAI.
@@ -50,18 +77,6 @@ _PROVIDER_CONFIG = {
     "glm": ("https://api.z.ai/api/paas/v4/", "ZHIPU_API_KEY"),
     "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
     "ollama": ("http://localhost:11434/v1", None),
-}
-
-# Provider-specific defaults for reliability
-_PROVIDER_DEFAULTS = {
-    "deepseek": {
-        "max_retries": 3,
-        "timeout": 120.0,  # DeepSeek can be slow; give it 2 minutes
-    },
-    "qwen": {
-        "max_retries": 3,
-        "timeout": 120.0,
-    },
 }
 
 
@@ -97,11 +112,6 @@ class OpenAIClient(BaseLLMClient):
                 api_key = os.environ.get(api_key_env)
                 if api_key:
                     llm_kwargs["api_key"] = api_key
-                else:
-                    raise ValueError(
-                        f"API key for provider '{self.provider}' is required but not set. "
-                        f"Please set the {api_key_env} environment variable."
-                    )
             else:
                 llm_kwargs["api_key"] = "ollama"
 
@@ -112,44 +122,10 @@ class OpenAIClient(BaseLLMClient):
         elif self.base_url:
             llm_kwargs["base_url"] = self.base_url
 
-        # Apply provider-specific defaults if not already set by user
-        if self.provider in _PROVIDER_DEFAULTS:
-            defaults = _PROVIDER_DEFAULTS[self.provider]
-            for key, default_value in defaults.items():
-                # User config takes precedence over defaults
-                if key not in self.kwargs and key not in llm_kwargs:
-                    llm_kwargs[key] = default_value
-
         # Forward user-provided kwargs
         for key in _PASSTHROUGH_KWARGS:
             if key in self.kwargs:
                 llm_kwargs[key] = self.kwargs[key]
-
-        # Create custom http_client with proper retry configuration for problematic providers
-        # This is critical for DeepSeek which has unstable connections
-        if self.provider in _PROVIDER_DEFAULTS and "http_client" not in llm_kwargs:
-            timeout_val = llm_kwargs.get("timeout", 120.0)
-            max_retries_val = llm_kwargs.get("max_retries", 3)
-            
-            # Convert timeout to httpx.Timeout format
-            if isinstance(timeout_val, (int, float)):
-                timeout = httpx.Timeout(timeout_val, connect=timeout_val, read=timeout_val, write=timeout_val, pool=timeout_val)
-            else:
-                timeout = timeout_val
-            
-            # Create retry object for httpx
-            retry_transport = httpx.HTTPTransport(
-                retries=max_retries_val,
-                timeout=timeout,
-            )
-            
-            # Create http_client with retry configuration
-            http_client = httpx.Client(
-                transport=retry_transport,
-                timeout=timeout,
-                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-            )
-            llm_kwargs["http_client"] = http_client
 
         # Native OpenAI: use Responses API for consistent behavior across
         # all model families. Third-party providers use Chat Completions.
@@ -161,3 +137,4 @@ class OpenAIClient(BaseLLMClient):
     def validate_model(self) -> bool:
         """Validate model for the provider."""
         return validate_model(self.provider, self.model)
+
